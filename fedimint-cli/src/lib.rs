@@ -21,7 +21,7 @@ use fedimint_bip39::Bip39RootSecretStrategy;
 use fedimint_client::module::init::{ClientModuleInit, ClientModuleInitRegistry};
 use fedimint_client::module::ClientModule as _;
 use fedimint_client::secret::{get_default_client_secret, RootSecretStrategy};
-use fedimint_client::{get_invite_code_from_db, Client, ClientArc, ClientBuilder};
+use fedimint_client::{get_invite_code_from_db, Client, ClientBuilder, ClientHandle};
 use fedimint_core::admin_client::WsAdminClient;
 use fedimint_core::api::{
     FederationApiExt, FederationError, IRawFederationApi, InviteCode, WsFederationApi,
@@ -519,7 +519,11 @@ impl FedimintCli {
         Ok(client_builder)
     }
 
-    async fn client_join(&mut self, cli: &Opts, invite_code: InviteCode) -> CliResult<ClientArc> {
+    async fn client_join(
+        &mut self,
+        cli: &Opts,
+        invite_code: InviteCode,
+    ) -> CliResult<ClientHandle> {
         let client_config = ClientConfig::download_from_invite_code(&invite_code)
             .await
             .map_err_cli_general()?;
@@ -532,7 +536,7 @@ impl FedimintCli {
             .join(
                 get_default_client_secret(
                     &Bip39RootSecretStrategy::<12>::to_root_secret(&mnemonic),
-                    &client_config.global.federation_id(),
+                    &client_config.global.calculate_federation_id(),
                 ),
                 client_config.clone(),
                 invite_code,
@@ -541,7 +545,7 @@ impl FedimintCli {
             .map_err_cli_general()
     }
 
-    async fn client_open(&mut self, cli: &Opts) -> CliResult<ClientArc> {
+    async fn client_open(&mut self, cli: &Opts) -> CliResult<ClientHandle> {
         let client_builder = self.make_client_builder(cli).await?;
 
         let mnemonic = Mnemonic::from_entropy(
@@ -556,7 +560,7 @@ impl FedimintCli {
             .await
             .map_err_cli_general()?;
 
-        let federation_id = config.federation_id();
+        let federation_id = config.calculate_federation_id();
 
         client_builder
             .open(get_default_client_secret(
@@ -572,7 +576,7 @@ impl FedimintCli {
         cli: &Opts,
         mnemonic: Mnemonic,
         invite_code: InviteCode,
-    ) -> CliResult<ClientArc> {
+    ) -> CliResult<ClientHandle> {
         let builder = self.make_client_builder(cli).await?;
 
         let client_config = ClientConfig::download_from_invite_code(&invite_code)
@@ -598,7 +602,7 @@ impl FedimintCli {
 
         let root_secret = get_default_client_secret(
             &Bip39RootSecretStrategy::<12>::to_root_secret(&mnemonic),
-            &client_config.federation_id(),
+            &client_config.calculate_federation_id(),
         );
         let backup = builder
             .download_backup_from_federation(&root_secret, &client_config)
@@ -609,6 +613,22 @@ impl FedimintCli {
             .await
             .map_err_cli_general()
     }
+
+    pub async fn discover_versions_and_log(&mut self) -> anyhow::Result<()> {
+      let cli_args_clone = self.cli_args.clone();
+      let client = self.client_open(&cli_args_clone).await?;
+      let version_info = client.discover_common_api_version(None).await?;
+
+      let core_version = version_info.core;
+      tracing::info!("Core Consensus Version: {}.{}", core_version.major, core_version.minor);
+
+      tracing::info!("Number of modules: {}", version_info.modules.len());
+      for (module_id, api_version) in version_info.modules.iter() {
+        tracing::info!("Module ID: {}, Version: {}.{}", module_id, api_version.major, api_version.minor);
+    }
+
+      Ok(())
+  }
 
     async fn handle_command(&mut self, cli: Opts) -> CliOutputResult {
         match cli.command.clone() {

@@ -10,7 +10,7 @@ use assert_matches::assert_matches;
 use bitcoin::Network;
 use bitcoin_hashes::{sha256, Hash};
 use fedimint_client::transaction::{ClientInput, ClientOutput, TransactionBuilder};
-use fedimint_client::ClientArc;
+use fedimint_client::ClientHandle;
 use fedimint_core::config::FederationId;
 use fedimint_core::core::{IntoDynInstance, OperationId};
 use fedimint_core::task::sleep_in_test;
@@ -83,7 +83,7 @@ async fn single_federation_test<B>(
             GatewayTest,
             Box<dyn LightningTest>,
             FederationTest,
-            ClientArc, // User Client
+            ClientHandle, // User Client
             Arc<dyn BitcoinTest>,
         ) -> B
         + Copy,
@@ -131,9 +131,6 @@ where
     let lightning = match lightning_node_type {
         LightningNodeType::Lnd => fixtures.lnd().await,
         LightningNodeType::Cln => fixtures.cln().await,
-        _ => {
-            panic!("Unsupported lightning implementation");
-        }
     };
 
     let gateway = fixtures
@@ -156,8 +153,8 @@ fn sha256(data: &[u8]) -> sha256::Hash {
 /// specified by `gateway_id`.
 async fn pay_valid_invoice(
     invoice: Bolt11Invoice,
-    user_client: &ClientArc,
-    gateway_client: &ClientArc,
+    user_client: &ClientHandle,
+    gateway_client: &ClientHandle,
     gateway_id: &PublicKey,
 ) -> anyhow::Result<()> {
     let user_lightning_module = &user_client.get_first_module::<LightningClientModule>();
@@ -209,51 +206,6 @@ async fn pay_valid_invoice(
         _ => panic!("Expected Lightning payment!"),
     }
     Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread")]
-#[ignore] // TODO: resolve in https://github.com/fedimint/fedimint/pull/4354
-async fn test_gateway_can_pay_ldk_node() -> anyhow::Result<()> {
-    // Running LDK Node with the mock services doesnt provide any additional
-    // coverage, since `FakeLightningTest` does not open any channels.
-    if !Fixtures::is_real_test() {
-        return Ok(());
-    }
-
-    single_federation_test(|gateway, _, fed, user_client, bitcoin| async move {
-        let ldk = Fixtures::spawn_ldk(bitcoin.clone()).await;
-
-        ldk.open_channel(
-            Amount::from_msats(5_000_000_000),
-            gateway.node_pub_key,
-            gateway.listening_addr.clone(),
-            bitcoin.lock_exclusive().await,
-        )
-        .await?;
-
-        let gateway_client = gateway.remove_client_hack(&fed).await;
-        // Print money for user_client
-        let dummy_module = user_client.get_first_module::<DummyClientModule>();
-        let (_, outpoint) = dummy_module.print_money(sats(1000)).await?;
-        dummy_module.receive_money(outpoint).await?;
-        assert_eq!(user_client.get_balance().await, sats(1000));
-
-        // Create test invoice
-        let invoice = ldk.invoice(sats(250), None).await?;
-        pay_valid_invoice(
-            invoice,
-            &user_client,
-            &gateway_client,
-            &gateway.gateway.gateway_id,
-        )
-        .await?;
-
-        assert_eq!(user_client.get_balance().await, sats(1000 - 250));
-        assert_eq!(gateway_client.get_balance().await, sats(250));
-
-        Ok(())
-    })
-    .await
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -986,7 +938,6 @@ async fn test_gateway_filters_route_hints_by_inbound() -> anyhow::Result<()> {
             let gateway_ln = match gateway_type {
                 LightningNodeType::Cln => fixtures.cln().await,
                 LightningNodeType::Lnd => fixtures.lnd().await,
-                LightningNodeType::Ldk => unimplemented!("LDK Node is not supported as a gateway"),
             };
 
             let GetNodeInfoResponse { pub_key, .. } = gateway_ln.info().await?;

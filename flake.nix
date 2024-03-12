@@ -9,7 +9,7 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
     flakebox = {
-      url = "github:dpc/flakebox?rev=49117df15209701f3e13ba2bcf514b550955e7b4";
+      url = "github:dpc/flakebox?rev=27ecbf8f2b252dd843d0f58d45658eb56bb5e223";
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.fenix.follows = "fenix";
     };
@@ -29,12 +29,14 @@
       overlayAll =
         nixpkgs.lib.composeManyExtensions
           [
+            (import ./nix/overlays/rocksdb.nix)
             (import ./nix/overlays/wasm-bindgen.nix)
             (import ./nix/overlays/cargo-nextest.nix)
             (import ./nix/overlays/cargo-llvm-cov.nix)
             (import ./nix/overlays/esplora-electrs.nix)
             (import ./nix/overlays/clightning.nix)
             (import ./nix/overlays/darwin-compile-fixes.nix)
+            (import ./nix/overlays/cargo-honggfuzz.nix)
           ];
     in
     {
@@ -45,6 +47,7 @@
         all = overlayAll;
         wasm-bindgen = import ./nix/overlays/wasm-bindgen.nix;
         darwin-compile-fixes = import ./nix/overlays/darwin-compile-fixes.nix;
+        cargo-honggfuzz = import ./nix/overlays/cargo-honggfuzz.nix;
       };
 
       bundlers = bundlers.bundlers;
@@ -104,56 +107,57 @@
             stdenv = pkgs.clang11Stdenv;
           };
 
-          # all standard toolchains provided by flakebox
-          toolchainsStd =
-            flakeboxLib.mkStdFenixToolchains toolchainArgs;
+          stdTargets = flakeboxLib.mkStdTargets { };
+          stdToolchains = flakeboxLib.mkStdToolchains toolchainArgs;
+
 
           # toolchains for the native build (default shell)
-          toolchainsNative = (pkgs.lib.getAttrs
-            [
-              "default"
-            ]
-            toolchainsStd
-          );
+          toolchainNative = flakeboxLib.mkFenixToolchain (toolchainArgs
+          // {
+            targets = (pkgs.lib.getAttrs
+              [
+                "default"
+                "wasm32-unknown"
+              ]
+              stdTargets
+            );
+          });
 
-          # toolchains for the `cross` shell
-          toolchainsCross = (pkgs.lib.getAttrs
-            ([
-              "default"
-              "nightly"
-              "aarch64-android"
-              "x86_64-android"
-              "arm-android"
-              "armv7-android"
-              "wasm32-unknown"
-            ] ++ lib.optionals pkgs.stdenv.isDarwin [
-              "aarch64-ios"
-              "aarch64-ios-sim"
-              "x86_64-ios"
-            ])
-            toolchainsStd
-          );
+          # toolchains for the native + wasm build
+          toolchainWasm = flakeboxLib.mkFenixToolchain (toolchainArgs
+          // {
+            defaultTarget = "wasm32-unknown-unknown";
+            targets = (pkgs.lib.getAttrs
+              [
+                "default"
+                "wasm32-unknown"
+              ]
+              stdTargets
+            );
 
-          # toolchains for the wasm build (`crossWasm` shell)
-          toolchainsWasm = (pkgs.lib.getAttrs
-            [
-              "default"
-              "wasm32-unknown"
-            ]
-            toolchainsStd
-          );
+            args = {
+              nativeBuildInputs = [ pkgs.firefox pkgs.wasm-bindgen-cli pkgs.geckodriver pkgs.wasm-pack ];
+            };
+          });
 
-          toolchainNative = flakeboxLib.mkFenixMultiToolchain {
-            toolchains = toolchainsNative;
-          };
-
-          toolchainAll = flakeboxLib.mkFenixMultiToolchain {
-            toolchains = toolchainsCross;
-          };
-          toolchainWasm = flakeboxLib.mkFenixMultiToolchain {
-            toolchains = toolchainsWasm;
-          };
-
+          # toolchains for the native + wasm build
+          toolchainAll = flakeboxLib.mkFenixToolchain (toolchainArgs
+          // {
+            targets = (pkgs.lib.getAttrs
+              ([
+                "default"
+                "aarch64-android"
+                "x86_64-android"
+                "arm-android"
+                "armv7-android"
+                "wasm32-unknown"
+              ] ++ lib.optionals pkgs.stdenv.isDarwin [
+                "aarch64-ios"
+                "aarch64-ios-sim"
+                "x86_64-ios"
+              ])
+              stdTargets);
+          });
           # Replace placeholder git hash in a binary
           #
           # To avoid impurity, we use a git hash placeholder when building binaries
@@ -198,7 +202,7 @@
             # to it.
             inherit craneMultiBuild;
 
-            toolchains = toolchainsCross;
+            toolchains = stdToolchains // { "wasm32-unknown" = toolchainWasm; };
             profiles = [ "dev" "ci" "test" "release" ];
           };
 
@@ -215,6 +219,8 @@
                   pkgs.cargo-deny
                   pkgs.parallel
                   pkgs.just
+                  pkgs.time
+                  pkgs.gawk
 
                   (pkgs.writeShellScriptBin "git-recommit" "exec git commit --edit -F <(cat \"$(git rev-parse --git-path COMMIT_EDITMSG)\" | grep -v -E '^#.*') \"$@\"")
 
@@ -282,6 +288,7 @@
 
                   export RUSTC_WRAPPER=${pkgs.sccache}/bin/sccache
                   export CARGO_BUILD_TARGET_DIR="''${CARGO_BUILD_TARGET_DIR:-''${root}/target-nix}"
+                  export FM_DISCOVER_API_VERSION_TIMEOUT=10
                 '';
               };
             in
@@ -290,6 +297,17 @@
               # so notably not building any project binaries, but including all
               # the settings and tools necessary to build and work with the codebase.
               default = flakeboxLib.mkDevShell (commonShellArgs // { });
+
+              fuzz = flakeboxLib.mkDevShell (commonShellArgs // {
+                nativeBuildInputs = with pkgs; [
+                  cargo-hongfuzz
+                  libbfd_2_38
+                  libunwind.dev
+                  libopcodes_2_38
+                  libblocksruntime
+                  lldb
+                ];
+              });
 
               lint = flakeboxLib.mkLintShell { };
 

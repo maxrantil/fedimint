@@ -167,7 +167,7 @@ pub struct GlobalClientConfig {
 }
 
 impl GlobalClientConfig {
-    pub fn federation_id(&self) -> FederationId {
+    pub fn calculate_federation_id(&self) -> FederationId {
         FederationId(self.api_endpoints.consensus_hash())
     }
 
@@ -193,8 +193,8 @@ impl ClientConfig {
         })
     }
 
-    pub fn federation_id(&self) -> FederationId {
-        self.global.federation_id()
+    pub fn calculate_federation_id(&self) -> FederationId {
+        self.global.calculate_federation_id()
     }
 
     /// Get the value of a given meta field
@@ -227,10 +227,9 @@ impl ClientConfig {
     /// Create an invite code with the api endpoint of the given peer which can
     /// be used to download this client config
     pub fn invite_code(&self, peer: &PeerId) -> Option<InviteCode> {
-        self.global
-            .api_endpoints
-            .get(peer)
-            .map(|peer_url| InviteCode::new(peer_url.url.clone(), *peer, self.federation_id()))
+        self.global.api_endpoints.get(peer).map(|peer_url| {
+            InviteCode::new(peer_url.url.clone(), *peer, self.calculate_federation_id())
+        })
     }
 
     /// Tries to download the client config from the federation,
@@ -292,7 +291,7 @@ impl ClientConfig {
             )
             .await?;
 
-        if client_config.federation_id() != federation_id {
+        if client_config.calculate_federation_id() != federation_id {
             bail!("Obtained client config has different federation id");
         }
 
@@ -470,14 +469,14 @@ impl<M> Default for ModuleInitRegistry<M> {
 /// during config gen
 #[derive(Debug, Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ConfigGenModuleParams {
-    pub local: Option<serde_json::Value>,
-    pub consensus: Option<serde_json::Value>,
+    pub local: serde_json::Value,
+    pub consensus: serde_json::Value,
 }
 
 pub type ServerModuleInitRegistry = ModuleInitRegistry<DynServerModuleInit>;
 
 impl ConfigGenModuleParams {
-    pub fn new(local: Option<serde_json::Value>, consensus: Option<serde_json::Value>) -> Self {
+    pub fn new(local: serde_json::Value, consensus: serde_json::Value) -> Self {
         Self { local, consensus }
     }
 
@@ -490,19 +489,15 @@ impl ConfigGenModuleParams {
         ))
     }
 
-    fn parse<P: DeserializeOwned>(
-        name: &str,
-        json: Option<serde_json::Value>,
-    ) -> anyhow::Result<P> {
-        let json = json.ok_or(format_err!("{name} config gen params missing"))?;
-        serde_json::from_value(json).context("Schema mismatch")
+    fn parse<P: DeserializeOwned>(name: &str, json: serde_json::Value) -> anyhow::Result<P> {
+        serde_json::from_value(json).with_context(|| format!("Schema mismatch for {name} argument"))
     }
 
     pub fn from_typed<P: ModuleInitParams>(p: P) -> anyhow::Result<Self> {
         let (local, consensus) = p.to_parts();
         Ok(Self {
-            local: Some(serde_json::to_value(local)?),
-            consensus: Some(serde_json::to_value(consensus)?),
+            local: serde_json::to_value(local)?,
+            consensus: serde_json::to_value(consensus)?,
         })
     }
 }

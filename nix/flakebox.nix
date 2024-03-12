@@ -159,6 +159,7 @@ let
       cargo-nextest
       moreutils-ts
       parallel
+      time
     ] ++ builtins.attrValues {
       inherit (pkgs) cargo-nextest;
     };
@@ -219,10 +220,22 @@ rec {
     buildPhaseCargoCommand = "cargoWithProfile doc --locked ; cargoWithProfile check --all-targets --locked ; cargoWithProfile build --locked --all-targets";
   };
 
+  workspaceDepsWasmTest = craneLib.buildWorkspaceDepsOnly {
+    pname = "${commonArgs.pname}-wasm-test";
+    buildPhaseCargoCommand = "cargoWithProfile build --locked --tests -p fedimint-wasm-tests";
+  };
+
+  workspaceBuildWasmTest = craneLib.buildWorkspace {
+    pnameSuffix = "-workspace-wasm-test";
+    cargoArtifacts = workspaceDepsWasmTest;
+    buildPhaseCargoCommand = "cargoWithProfile build --locked --tests -p fedimint-wasm-tests";
+  };
+
   workspaceTest = craneLib.cargoNextest {
     cargoArtifacts = workspaceBuild;
     cargoExtraArgs = "--workspace --all-targets --locked";
 
+    FM_DISCOVER_API_VERSION_TIMEOUT = "10";
     FM_CARGO_DENY_COMPILATION = "1";
   };
 
@@ -323,6 +336,9 @@ rec {
   workspaceTestCovBase = { times }: craneLib.buildPackage {
     pname = "fedimint-workspace-lcov";
     cargoArtifacts = workspaceCov;
+
+    FM_DISCOVER_API_VERSION_TIMEOUT = "10";
+
     buildPhaseCargoCommand = (''
       source <(cargo llvm-cov show-env --export-prefix)
     '' +
@@ -389,24 +405,39 @@ rec {
 
   ciTestAllBase = { times }: craneLibTests.mkCargoDerivation {
     pname = "${commonCliTestArgs.pname}-all";
-    cargoArtifacts = workspaceBuild;
+    cargoArtifacts = craneMultiBuild.default.${craneLib.cargoProfile or "release"}.workspaceBuild;
+
+    FM_DISCOVER_API_VERSION_TIMEOUT = "10";
 
     # One normal run, then if succeeded, modify the "always success test" to fail,
     # and make sure we detect it (happened too many times that we didn't).
     # Thanks to early termination, this should be all very quick, as we actually
     # won't start other tests.
-    buildPhaseCargoCommand = lib.concatStringsSep "\n" (
-      lib.replicate times ''
-        patchShebangs ./scripts
-        export FM_CARGO_DENY_COMPILATION=1
-        ./scripts/tests/test-ci-all.sh || exit 1
-        cp scripts/tests/always-success-test.sh scripts/tests/always-success-test.sh.bck
-        sed -i -e 's/exit 0/exit 1/g' scripts/tests/always-success-test.sh
-        echo "Verifying failure detection..."
-        ./scripts/tests/test-ci-all.sh 1>/dev/null 2>/dev/null && exit 1
-        cp -f scripts/tests/always-success-test.sh.bck scripts/tests/always-success-test.sh
+    buildPhaseCargoCommand =
       ''
-    );
+        # when running on a wasm32-unknown toolchain...
+        if [ "$CARGO_BUILD_TARGET" == "wasm32-unknown-unknown" ]; then
+          # import pre-built wasm32-unknown wasm test artifacts
+          # notably, they are extracted to target's sub-directory, where wasm-test.sh expects them
+          inheritCargoArtifacts ${craneMultiBuild.wasm32-unknown.${craneLib.cargoProfile or "release"}.workspaceBuildWasmTest} "target/pkgs/fedimint-wasm-tests"
+        fi
+        # default to building for native; running test for cross-compilation targets
+        # here doesn't make any sense, and `wasm32-unknown-unknown` toolchain is used
+        # mostly to opt-in into wasm tests
+        unset CARGO_BUILD_TARGET
+      '' +
+      lib.concatStringsSep "\n" (
+        lib.replicate times ''
+          patchShebangs ./scripts
+          export FM_CARGO_DENY_COMPILATION=1
+          ./scripts/tests/test-ci-all.sh || exit 1
+          cp scripts/tests/always-success-test.sh scripts/tests/always-success-test.sh.bck
+          sed -i -e 's/exit 0/exit 1/g' scripts/tests/always-success-test.sh
+          echo "Verifying failure detection..."
+          ./scripts/tests/test-ci-all.sh 1>/dev/null 2>/dev/null && exit 1
+          cp -f scripts/tests/always-success-test.sh.bck scripts/tests/always-success-test.sh
+        ''
+      );
   };
 
   ciTestAll = ciTestAllBase { times = 1; };
@@ -422,9 +453,11 @@ rec {
   wasmTest = craneLibTests.mkCargoDerivation {
     pname = "wasm-test";
     # TODO: https://github.com/ipetkov/crane/issues/416
-    cargoArtifacts = craneMultiBuild.${craneLib.cargoProfile or "release"}.workspaceBuild;
+    cargoArtifacts = craneMultiBuild.default.${craneLib.cargoProfile or "release"}.workspaceBuild;
     nativeBuildInputs = commonCliTestArgs.nativeBuildInputs ++ [ pkgs.firefox pkgs.wasm-bindgen-cli pkgs.geckodriver pkgs.wasm-pack ];
-    buildPhaseCargoCommand = "patchShebangs ./scripts; SKIP_CARGO_BUILD=1 ./scripts/tests/wasm-test.sh";
+    buildPhaseCargoCommand = ''
+      inheritCargoArtifacts ${craneMultiBuild.wasm32-unknown.${craneLib.cargoProfile or "release"}.workspaceBuildWasmTest} "target/pkgs/fedimint-wasm-tests"
+      patchShebangs ./scripts; SKIP_CARGO_BUILD=1 ./scripts/tests/wasm-test.sh'';
   };
 
   fedimint-pkgs = fedimintBuildPackageGroup {

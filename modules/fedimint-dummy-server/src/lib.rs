@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::string::ToString;
 
 use anyhow::bail;
 use async_trait::async_trait;
@@ -119,9 +118,7 @@ impl ServerModuleInit for DummyInit {
             .iter()
             .map(|&peer| {
                 let config = DummyConfig {
-                    local: DummyConfigLocal {
-                        example: params.local.0.clone(),
-                    },
+                    local: DummyConfigLocal {},
                     private: DummyConfigPrivate,
                     consensus: DummyConfigConsensus {
                         tx_fee: params.consensus.tx_fee,
@@ -141,9 +138,7 @@ impl ServerModuleInit for DummyInit {
         let params = self.parse_params(params).unwrap();
 
         Ok(DummyConfig {
-            local: DummyConfigLocal {
-                example: params.local.0.clone(),
-            },
+            local: DummyConfigLocal {},
             private: DummyConfigPrivate,
             consensus: DummyConfigConsensus {
                 tx_fee: params.consensus.tx_fee,

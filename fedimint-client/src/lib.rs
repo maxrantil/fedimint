@@ -72,7 +72,6 @@ use std::collections::{BTreeMap, HashSet};
 use std::fmt::{Debug, Formatter};
 use std::ops::{self, Range};
 use std::pin::Pin;
-use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -113,8 +112,8 @@ use fedimint_core::{
 };
 pub use fedimint_derive_secret as derivable_secret;
 use fedimint_derive_secret::DerivableSecret;
-use fedimint_logging::LOG_CLIENT;
-use futures::{Future, StreamExt};
+use fedimint_logging::{LOG_CLIENT, LOG_CLIENT_RECOVERY};
+use futures::{Future, Stream, StreamExt};
 use module::recovery::RecoveryProgress;
 use module::{DynClientModule, FinalClient};
 use rand::thread_rng;
@@ -124,6 +123,7 @@ use thiserror::Error;
 #[cfg(not(target_family = "wasm"))]
 use tokio::runtime::{Handle as RuntimeHandle, RuntimeFlavor};
 use tokio::sync::watch;
+use tokio_stream::wrappers::WatchStream;
 use tracing::{debug, error, info, warn};
 
 use crate::backup::Metadata;
@@ -178,6 +178,13 @@ pub enum AddStateMachinesError {
     StateAlreadyExists,
     #[error("Got {0}")]
     Other(#[from] anyhow::Error),
+}
+
+pub enum DiscoverCommonApiVersionMode {
+    /// Get the response from only a few peers, or until a timeout
+    Fast,
+    /// Try to get a reasponse from all peers, or until a timeout
+    Full,
 }
 
 pub type AddStateMachinesResult = Result<(), AddStateMachinesError>;
@@ -508,33 +515,40 @@ fn states_add_instance(
     })
 }
 
-/// Atomically-counted ([`Arc`]) handle to [`Client`]
+/// Shared, inner data of [`ClientHandle`]
 ///
-/// Notably it `deref`-s to the [`Client`] where most
-/// methods live.
-#[derive(Debug)]
-pub struct ClientArc {
-    // Use [`ClientArc::new`] instead
+/// The primary responsibility of this struct (and two levels of Arc),
+/// is shutting down `Client` on the drop of last [`ClientHandle`]. See
+/// [`ClientHandleShared::drop`] for details.
+#[derive(Debug, Clone)]
+struct ClientHandleShared {
     inner: Option<Arc<Client>>,
-
-    __use_constructor_to_create: (),
 }
 
-impl ClientArc {
+/// User handle to [`Client`]
+///
+/// Clonable. On the drop of last [`ClientHandle`] the client
+/// will be shut-down, and resources it used freed.
+///
+/// Notably it [`ops::Deref`]s to the [`Client`] where most
+/// methods live.
+#[derive(Debug, Clone)]
+pub struct ClientHandle {
+    inner: Arc<ClientHandleShared>,
+}
+
+impl ClientHandle {
     /// Create
     fn new(inner: Arc<Client>) -> Self {
-        inner
-            .client_count
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Self {
-            inner: Some(inner),
-            // this is the constructor
-            __use_constructor_to_create: (),
+            inner: Arc::new(ClientHandleShared {
+                inner: inner.into(),
+            }),
         }
     }
 
     fn as_inner(&self) -> &Arc<Client> {
-        self.inner.as_ref().expect("Inner always set")
+        self.inner.inner.as_ref().expect("Inner always set")
     }
 
     pub async fn start_executor(&self) {
@@ -563,37 +577,50 @@ impl ClientArc {
     }
 }
 
-impl ops::Deref for ClientArc {
+impl ops::Deref for ClientHandle {
     type Target = Client;
 
     fn deref(&self) -> &Self::Target {
-        self.inner.as_ref().expect("Must have inner client set")
+        self.inner
+            .inner
+            .as_ref()
+            .expect("Must have inner client set")
     }
 }
 
-impl ClientArc {
-    pub fn downgrade(&self) -> ClientWeak {
+impl ClientHandle {
+    pub(crate) fn downgrade(&self) -> ClientWeak {
         ClientWeak {
-            inner: Arc::downgrade(self.inner.as_ref().expect("Inner always set")),
+            inner: Arc::downgrade(self.inner.inner.as_ref().expect("Inner always set")),
         }
     }
 }
 
-impl Clone for ClientArc {
-    fn clone(&self) -> Self {
-        ClientArc::new(self.inner.clone().expect("Must have inner client set"))
+/// Internal self-reference to [`Client`]
+#[derive(Debug, Clone)]
+pub(crate) struct ClientStrong {
+    inner: Arc<Client>,
+}
+
+impl ops::Deref for ClientStrong {
+    type Target = Client;
+
+    fn deref(&self) -> &Self::Target {
+        self.inner.deref()
     }
 }
 
-/// Like [`ClientArc`] but using a [`Weak`] handle to [`Client`]
+/// Like [`ClientStrong`] but using a [`Weak`] handle to [`Client`]
+///
+/// This is not meant to be used by external code.
 #[derive(Debug, Clone)]
-pub struct ClientWeak {
+pub(crate) struct ClientWeak {
     inner: Weak<Client>,
 }
 
 impl ClientWeak {
-    pub fn upgrade(&self) -> Option<ClientArc> {
-        Weak::upgrade(&self.inner).map(ClientArc::new)
+    pub fn upgrade(&self) -> Option<ClientStrong> {
+        Weak::upgrade(&self.inner).map(|inner| ClientStrong { inner })
     }
 }
 
@@ -602,54 +629,49 @@ impl ClientWeak {
 /// `ExecutorInner` should already take care of that. The reason is that as long
 /// as the executor task is active there may be a cycle in the
 /// `Arc<Client>`s such that at least one `Executor` never gets dropped.
-impl Drop for ClientArc {
+impl Drop for ClientHandleShared {
     fn drop(&mut self) {
-        // Not sure if Ordering::SeqCst is strictly needed here, but better safe than
-        // sorry.
-        let client_count = self
-            .as_inner()
-            .client_count
-            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        debug!(target: LOG_CLIENT, "Shutting down the Client on last handle drop");
+        let inner = self.inner.take().expect("Must have inner client set");
+        inner.executor.stop_executor();
 
-        // `fetch_sub` returns previous value, so if it is 1, it means this is the last
-        // client reference
-        if client_count == 1 {
-            info!("Last client reference dropped, shutting down client task group");
-            let inner = self.inner.take().expect("Must have inner client set");
-            inner.executor.stop_executor();
+        #[cfg(not(target_family = "wasm"))]
+        {
+            if RuntimeHandle::current().runtime_flavor() == RuntimeFlavor::CurrentThread {
+                // We can't use block_on in single-threaded mode
+                return;
+            }
 
-            #[cfg(not(target_family = "wasm"))]
-            {
-                if RuntimeHandle::current().runtime_flavor() == RuntimeFlavor::CurrentThread {
-                    // We can't use block_on in single-threaded mode
-                    return;
-                }
+            let db = inner.db.clone();
 
-                let db = inner.db.clone();
-                let federation_id = inner.federation_id();
-
-                drop(inner);
-
-                // wait until `self.inner.db` is the only strong reference
-                for attempt in 0u64.. {
-                    let strong_count = db.strong_count();
-                    if strong_count <= 1 {
-                        break;
-                    }
-                    tokio::task::block_in_place(|| {
-                        futures::executor::block_on(async {
-                            // we want to retry fast, give feedback, but not spam
-                            if attempt % 100 == 0 {
-                                info!(
-                                    %federation_id,
-                                    strong_count,
-                                    "Waiting for client database to stop being used"
-                                );
-                            }
-                            fedimint_core::task::sleep(Duration::from_millis(10)).await;
-                        });
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async {
+                        // futures::executor::block_on(async {
+                        debug!(target: LOG_CLIENT, "Waiting for client task group to shut down");
+                        if let Err(err) = inner
+                            .task_group
+                            .clone()
+                            .shutdown_join_all(Some(Duration::from_secs(30)))
+                            .await
+                        {
+                            warn!(target: LOG_CLIENT, %err, "Error waiting for client task group to shut down");
+                        }
                     });
-                }
+            });
+
+            let client_strong_count = Arc::strong_count(&inner);
+            debug!(target: LOG_CLIENT, "Dropping last handle to Client");
+            // We are sure that no background tasks are running in the client anymore, so we
+            // can drop the (usually) last inner reference.
+            drop(inner);
+
+            if client_strong_count != 1 {
+                debug!(target: LOG_CLIENT, count = client_strong_count - 1, LOG_CLIENT, "External Client references remaining after last handle dropped");
+            }
+
+            let db_strong_count = db.strong_count();
+            if db_strong_count != 1 {
+                debug!(target:  LOG_CLIENT, count = db_strong_count - 1, "External DB references remaining after last handle dropped");
             }
         }
     }
@@ -702,13 +724,6 @@ pub struct Client {
     secp_ctx: Secp256k1<secp256k1_zkp::All>,
 
     task_group: TaskGroup,
-    /// Number of [`ClientArc`] instances using this `Client`.
-    ///
-    /// The `Client` struct is both used for the client itself as well as
-    /// for the global context used in the state machine executor. This means we
-    /// cannot rely on the reference count of the `Arc<Client>` to
-    /// determine if the client should shut down.
-    client_count: AtomicUsize,
 
     /// Updates about client recovery progress
     client_recovery_progress_receiver:
@@ -1313,13 +1328,17 @@ impl Client {
         })
     }
 
-    pub async fn discover_common_api_version(&self) -> anyhow::Result<ApiVersionSet> {
+    pub async fn discover_common_api_version(
+        &self,
+        threshold: Option<usize>,
+    ) -> anyhow::Result<ApiVersionSet> {
         Ok(self
             .api()
             .discover_api_version_set(
                 &Self::supported_api_versions_summary_static(self.get_config(), &self.module_inits)
                     .await,
                 get_discover_api_version_timeout(),
+                threshold,
             )
             .await?)
     }
@@ -1330,11 +1349,18 @@ impl Client {
         config: &ClientConfig,
         client_module_init: &ClientModuleInitRegistry,
         api: &DynGlobalApi,
+        mode: DiscoverCommonApiVersionMode,
     ) -> anyhow::Result<ApiVersionSet> {
         Ok(api
             .discover_api_version_set(
                 &Self::supported_api_versions_summary_static(config, client_module_init).await,
                 get_discover_api_version_timeout(),
+                match mode {
+                    DiscoverCommonApiVersionMode::Fast => {
+                        Some((config.global.api_endpoints.len() / 2).min(1))
+                    }
+                    DiscoverCommonApiVersionMode::Full => None,
+                },
             )
             .await?)
     }
@@ -1381,6 +1407,7 @@ impl Client {
         module_inits: &ModuleInitRegistry<DynClientModuleInit>,
         api: &DynGlobalApi,
         db: &Database,
+        task_group: &TaskGroup,
     ) -> anyhow::Result<ApiVersionSet> {
         if let Some(v) = db
             .begin_transaction()
@@ -1395,22 +1422,44 @@ impl Client {
             let db = db.clone();
             // Separate task group, because we actually don't want to be waiting for this to
             // finish, and it's just best effort.
-            TaskGroup::new()
-                .spawn("refresh_common_api_version_static", |_| async move {
-                    if let Err(e) =
-                        Self::refresh_common_api_version_static(&config, &module_inits, &api, &db)
-                            .await
-                    {
-                        warn!("Failed to discover common api versions: {e}");
-                    }
-                })
+            task_group
+                .spawn(
+                    "refresh_common_api_version_static",
+                    |task_handle| async move {
+                        let ok_or_canceled = task_handle
+                            .cancel_on_shutdown(async {
+                                if let Err(e) = Self::refresh_common_api_version_static(
+                                    &config,
+                                    &module_inits,
+                                    &api,
+                                    &db,
+                                    DiscoverCommonApiVersionMode::Full,
+                                )
+                                .await
+                                {
+                                    warn!("Failed to discover common api versions: {e}");
+                                }
+                            })
+                            .await;
+                        if ok_or_canceled.is_err() {
+                            debug!("Refreshing common api task version canceled");
+                        };
+                    },
+                )
                 .await;
 
             return Ok(v.0);
         }
 
         debug!("No existing cached common api versions found, waiting for initial discovery");
-        Self::refresh_common_api_version_static(config, module_inits, api, db).await
+        Self::refresh_common_api_version_static(
+            config,
+            module_inits,
+            api,
+            db,
+            DiscoverCommonApiVersionMode::Fast,
+        )
+        .await
     }
 
     async fn refresh_common_api_version_static(
@@ -1418,11 +1467,12 @@ impl Client {
         module_inits: &ModuleInitRegistry<DynClientModuleInit>,
         api: &DynGlobalApi,
         db: &Database,
+        mode: DiscoverCommonApiVersionMode,
     ) -> anyhow::Result<ApiVersionSet> {
         debug!("Refreshing common api versions");
 
         let common_api_versions =
-            Client::discover_common_api_version_static(config, module_inits, api).await?;
+            Client::discover_common_api_version_static(config, module_inits, api, mode).await?;
 
         debug!(
             value = ?common_api_versions,
@@ -1489,14 +1539,25 @@ impl Client {
         let mut recovery_receiver = self.client_recovery_progress_receiver.clone();
         recovery_receiver
             .wait_for(|in_progress| {
-                !in_progress
+                in_progress
                     .iter()
-                    .any(|(_id, progress)| !progress.is_done())
+                    .all(|(_id, progress)| progress.is_done())
             })
             .await
             .context("Recovery task completed and update receiver disconnected, but some modules failed to recover")?;
 
         Ok(())
+    }
+
+    /// Subscribe to recover progress for all the modules.
+    ///
+    /// This stream can contain duplicate progress for a module.
+    /// Don't use this stream for detecting completion of recovery.
+    pub fn subscribe_to_recovery_progress(
+        &self,
+    ) -> impl Stream<Item = (ModuleInstanceId, RecoveryProgress)> {
+        WatchStream::new(self.client_recovery_progress_receiver.clone())
+            .flat_map(futures::stream::iter)
     }
 
     pub async fn wait_for_module_kind_recovery(
@@ -1607,14 +1668,18 @@ impl Client {
         while let Some((module_instance_id, progress)) = futures.next().await {
             let mut dbtx = db.begin_transaction().await;
 
-            let progress = if let Some(progress) = progress {
+            let prev_progress = *recovery_sender
+                .borrow()
+                .get(&module_instance_id)
+                .expect("existing progress must be present");
+
+            let progress = if prev_progress.is_done() {
+                // since updates might be out of order, once done, stick with it
+                prev_progress
+            } else if let Some(progress) = progress {
                 progress
             } else {
-                recovery_sender
-                    .borrow()
-                    .get(&module_instance_id)
-                    .expect("existing progress must be present")
-                    .to_complete()
+                prev_progress.to_complete()
             };
 
             info!(
@@ -1634,6 +1699,7 @@ impl Client {
                 v.insert(module_instance_id, progress);
             });
         }
+        debug!(target: LOG_CLIENT_RECOVERY, "Recovery executor stopped");
     }
 }
 
@@ -1756,7 +1822,7 @@ impl ClientBuilder {
         config: ClientConfig,
         invite_code: InviteCode,
         init_mode: InitMode,
-    ) -> anyhow::Result<ClientArc> {
+    ) -> anyhow::Result<ClientHandle> {
         if Client::is_initialized(&self.db).await {
             bail!("Client database already initialized")
         }
@@ -1769,7 +1835,7 @@ impl ClientBuilder {
             // Save config to DB
             dbtx.insert_new_entry(
                 &ClientConfigKey {
-                    id: config.federation_id(),
+                    id: config.calculate_federation_id(),
                 },
                 &config,
             )
@@ -1877,7 +1943,7 @@ impl ClientBuilder {
         root_secret: DerivableSecret,
         config: ClientConfig,
         invite_code: InviteCode,
-    ) -> anyhow::Result<ClientArc> {
+    ) -> anyhow::Result<ClientHandle> {
         self.init(root_secret, config, invite_code, InitMode::Fresh)
             .await
     }
@@ -1913,7 +1979,7 @@ impl ClientBuilder {
         config: ClientConfig,
         invite_code: InviteCode,
         backup: Option<ClientBackup>,
-    ) -> anyhow::Result<ClientArc> {
+    ) -> anyhow::Result<ClientHandle> {
         let client = self
             .init(
                 root_secret,
@@ -1928,7 +1994,7 @@ impl ClientBuilder {
         Ok(client)
     }
 
-    pub async fn open(self, root_secret: DerivableSecret) -> anyhow::Result<ClientArc> {
+    pub async fn open(self, root_secret: DerivableSecret) -> anyhow::Result<ClientHandle> {
         let Some(config) = Client::get_config_from_db(&self.db).await else {
             bail!("Client database not initialized")
         };
@@ -1946,11 +2012,13 @@ impl ClientBuilder {
         self,
         root_secret: DerivableSecret,
         config: ClientConfig,
-    ) -> anyhow::Result<ClientArc> {
+    ) -> anyhow::Result<ClientHandle> {
         let decoders = self.decoders(&config);
         let config = Self::config_decoded(config, &decoders)?;
+        let fed_id = config.calculate_federation_id();
         let db = self.db.with_decoders(decoders.clone());
         let api = DynGlobalApi::from_config(&config);
+        let task_group = TaskGroup::new();
 
         // Migrate the database before interacting with it in case any on-disk data
         // structures have changed.
@@ -1969,6 +2037,7 @@ impl ClientBuilder {
             &self.module_inits,
             &api,
             &db,
+            &task_group,
         )
         .await?;
 
@@ -2006,7 +2075,6 @@ impl ClientBuilder {
                 // the recovery call is extracted here.
                 let start_module_recover_fn =
                     |snapshot: Option<ClientBackup>, progress: RecoveryProgress| {
-                        let config = config.clone();
                         let module_config = module_config.clone();
                         let db = db.clone();
                         let kind = kind.clone();
@@ -2021,7 +2089,7 @@ impl ClientBuilder {
                                 module_init
                                         .recover(
                                             final_client.clone(),
-                                            config.global.federation_id(),
+                                            fed_id,
                                             module_config.clone(),
                                             db.clone(),
                                             module_instance_id,
@@ -2089,7 +2157,7 @@ impl ClientBuilder {
                     let module = module_init
                         .init(
                             final_client.clone(),
-                            config.global.federation_id(),
+                            fed_id,
                             module_config,
                             db.clone(),
                             module_instance_id,
@@ -2137,7 +2205,9 @@ impl ClientBuilder {
                 executor_builder.with_valid_module_id(*module_instance_id);
             }
 
-            executor_builder.build(db.clone(), notifier).await
+            executor_builder
+                .build(db.clone(), notifier, task_group.clone())
+                .await
         };
 
         let recovery_receiver_init_val = BTreeMap::from_iter(
@@ -2152,7 +2222,7 @@ impl ClientBuilder {
             config: config.clone(),
             decoders,
             db: db.clone(),
-            federation_id: config.global.federation_id(),
+            federation_id: fed_id,
             federation_meta: config.global.meta,
             primary_module_instance,
             modules,
@@ -2161,13 +2231,12 @@ impl ClientBuilder {
             api,
             secp_ctx: Secp256k1::new(),
             root_secret,
-            task_group: TaskGroup::new(),
+            task_group,
             operation_log: OperationLog::new(db),
-            client_count: Default::default(),
             client_recovery_progress_receiver,
         });
 
-        let client_arc = ClientArc::new(client_inner);
+        let client_arc = ClientHandle::new(client_inner);
 
         final_client.set(client_arc.downgrade());
 
@@ -2228,7 +2297,7 @@ impl ClientBuilder {
         root_secret: &DerivableSecret,
         config: &ClientConfig,
     ) -> DerivableSecret {
-        root_secret.federation_key(&config.global.federation_id())
+        root_secret.federation_key(&config.global.calculate_federation_id())
     }
 }
 

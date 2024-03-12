@@ -346,6 +346,7 @@ pub async fn latency_tests(dev_fed: DevFed, r#type: LatencyTest) -> Result<()> {
 }
 
 pub async fn cli_tests(dev_fed: DevFed) -> Result<()> {
+    let fedimint_cli_version = crate::util::FedimintCli::version_or_default().await;
     log_binary_versions().await?;
     let data_dir = env::var("FM_DATA_DIR")?;
 
@@ -408,7 +409,7 @@ pub async fn cli_tests(dev_fed: DevFed) -> Result<()> {
 
     fed.pegin_gateway(10_000_000, &gw_cln).await?;
 
-    let fed_id = fed.federation_id().await;
+    let fed_id = fed.calculate_federation_id().await;
     let invite = fed.invite_code()?;
     let invite_code = cmd!(client, "dev", "decode-invite-code", invite.clone())
         .out_json()
@@ -616,18 +617,23 @@ pub async fn cli_tests(dev_fed: DevFed) -> Result<()> {
         .as_str()
         .map(|s| s.to_owned())
         .unwrap();
-    let client_reissue_amt = cmd!(
-        client,
-        "module",
-        "--module",
-        "mint",
-        "reissue",
-        reissue_notes
-    )
-    .out_json()
-    .await?
-    .as_u64()
-    .unwrap();
+    let client_reissue_amt =
+        if VersionReq::parse(">=0.3.0-alpha")?.matches(&fedimint_cli_version) {
+            cmd!(client, "module", "mint", "reissue", reissue_notes)
+        } else {
+            cmd!(
+                client,
+                "module",
+                "--module",
+                "mint",
+                "reissue",
+                reissue_notes
+            )
+        }
+        .out_json()
+        .await?
+        .as_u64()
+        .unwrap();
     assert_eq!(client_reissue_amt, reissue_amount);
 
     // Before doing a normal payment, let's start with a HOLD invoice and only
@@ -775,7 +781,7 @@ pub async fn cli_tests(dev_fed: DevFed) -> Result<()> {
         .bolt11;
     tokio::try_join!(cln.await_block_processing(), lnd.await_block_processing())?;
     cmd!(client, "ln-pay", invoice.clone()).run().await?;
-    let fed_id = fed.federation_id().await;
+    let fed_id = fed.calculate_federation_id().await;
 
     let invoice_status = cln
         .request(cln_rpc::model::requests::WaitanyinvoiceRequest {
@@ -995,9 +1001,8 @@ pub async fn finish_hold_invoice_payment(
             Ok(Some(Ok(invoice))) => {
                 if invoice.state() == tonic_lnd::lnrpc::invoice::InvoiceState::Accepted {
                     break;
-                } else {
-                    debug!("hold invoice payment state: {:?}", invoice.state());
                 }
+                debug!("hold invoice payment state: {:?}", invoice.state());
             }
             Ok(Some(Err(e))) => {
                 bail!("error in invoice subscription: {e:?}");
@@ -1380,8 +1385,8 @@ pub async fn lightning_gw_reconnect_test(
                 Err(e) => {
                     if i == MAX_RETRIES - 1 {
                         return Err(e);
-                    } else {
-                        tracing::debug!(
+                    }
+                    tracing::debug!(
                             "Pay invoice for gateway {} failed with {e:?}, retrying in {} seconds (try {}/{MAX_RETRIES})",
                             gw.ln
                                 .as_ref()
@@ -1390,12 +1395,11 @@ pub async fn lightning_gw_reconnect_test(
                             RETRY_INTERVAL.as_secs(),
                             i + 1,
                         );
-                        fedimint_core::task::sleep_in_test(
-                            "paying invoice for gateway failed",
-                            RETRY_INTERVAL,
-                        )
-                        .await;
-                    }
+                    fedimint_core::task::sleep_in_test(
+                        "paying invoice for gateway failed",
+                        RETRY_INTERVAL,
+                    )
+                    .await;
                 }
             }
         }
@@ -1794,12 +1798,11 @@ pub async fn recoverytool_test(dev_fed: DevFed) -> Result<()> {
         let outputs = output.as_array().context("expected an array")?;
         if outputs.len() >= fed_utxos_sats.len() {
             break outputs.clone();
-        } else if now.elapsed()? > Duration::from_secs(180) {
-            // 3 minutes should be enough to finish one or two sessions
-            bail!("recoverytool epochs method timed out");
-        } else {
-            fedimint_core::task::sleep_in_test("recovery failed", Duration::from_secs(1)).await
         }
+        if now.elapsed()? > Duration::from_secs(180) {
+            bail!("recoverytool epochs method timed out");
+        }
+        fedimint_core::task::sleep_in_test("recovery failed", Duration::from_secs(1)).await
     };
     let epochs_descriptors = outputs
         .iter()
@@ -1895,6 +1898,7 @@ pub async fn guardian_backup_test(dev_fed: DevFed, process_mgr: &ProcessManager)
         let mut file = std::fs::File::options()
             .write(true)
             .create(true)
+            .truncate(true)
             .open(data_dir.join(name))
             .expect("could not open file");
         file.write_all(data).expect("could not write file");
